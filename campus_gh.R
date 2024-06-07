@@ -18,10 +18,10 @@ college_campuses<-
   college_campuses|>
   st_transform(crs=new_crs)
 
-# now get the bbox for each campus
+# now get the gh list for each campus
 
 gh_list<-
-  map2_dfr(
+  purrr::map2(
     college_campuses$geometry,
     college_campuses$UNIQUEID,
     \(g,n) {
@@ -39,7 +39,9 @@ gh_list<-
       
       gh=tibble(UNIQUEID=n,gh=grid|>rownames())
       return(gh)
-    }
-  )
+    },
+    .progress = T
+  )|>
+  list_rbind()
   
 gh_list|>write_csv("./Data/campus_geohash_list.csv")
