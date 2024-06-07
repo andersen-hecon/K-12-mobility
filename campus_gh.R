@@ -22,8 +22,8 @@ college_campuses<-
 
 gh_list<-
   map2_dfr(
-    college_campuses$geometry[1:5],
-    college_campuses$UNIQUEID[1:5],
+    college_campuses$geometry,
+    college_campuses$UNIQUEID,
     \(g,n) {
       g=st_sfc(g,crs=new_crs)|>st_as_sf()
       
