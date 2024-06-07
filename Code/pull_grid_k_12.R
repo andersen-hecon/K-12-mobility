@@ -3,29 +3,78 @@ library(tidyverse)
 library(sf)
 library(geohashTools)
 library(osmdata)
+library(furrr)
 
-xy_precision=gh_delta(7L)
+xy_precision=2*gh_delta(7L)
 
-k12=readr::read_csv("https://stg-arcgisazurecdataprod1.az.arcgis.com/exportfiles-2023-105258/Public_Schools_-7669544197405643438.csv?sv=2018-03-28&sr=b&sig=cJbBcidZR0heujJyQkSyuX%2BJxOxL6BSMxDW96Nkb6To%3D&se=2024-06-06T21%3A09%3A48Z&sp=r")
+k12=readr::read_csv("./Input-Data/Public_Schools_-7669544197405643438.csv")
 
-k12$osm_response<-
-  map2(k12$Longitude,k12$Latitude,
-       ~opq_around(lon = .x,lat=.y,radius=250)|>
-         osmdata_sf()|>
-         enframe()|>
-         filter(
-           str_detect(name,"^osm_"),
-           !map_lgl(value,~is.null(.))
-           )|>
-         mutate(
-           value=map(value,~filter(.,if_any(-geometry,~str_to_lower(.)=="school")))
-           )|>
-         filter(
-           map_lgl(value,~nrow(.)>0)
-           )|>
-         jsonify::to_json(.)
+get_nearby_osm<-
+  purrr::possibly(
+    function(lon,lat,radius=250,id=NULL) {
+      osm_d<-
+        opq_around(lon = lon,lat=lat,radius=radius)|>
+        osmdata_sf()|>
+        enframe()|>
+        filter(
+          str_detect(name,"^osm_"),
+          !map_lgl(value,~is.null(.))
+        )|>
+        mutate(
+          value=map(value,~filter(.,if_any(-geometry,~str_to_lower(.)=="school")))
+        )|>
+        filter(
+          map_lgl(value,~nrow(.)>0)
+        )
+      
+      keep_vars=c("name","amenity","building")
+      osm_d<-
+        osm_d|>
+        mutate(
+          value=map(
+            value,
+            \(v) {
+              v=v|>select(any_of(c(keep_vars)))
+              
+              v<-
+                v|>rownames_to_column(var="osm_id")
+              for (var in keep_vars) {
+                if (!(var %in% colnames(v))) {
+                  v[[var]] <- ""
+                }
+              }
+              
+              
+              
+              return(v)
+            }
+          )
+        )
+      
+      osm_d=if(nrow(osm_d)==1) osm_d$value[[1]]
+      else bind_rows(osm_d$value)
+      
+    
+      if(!is.null(id)) osm_d$id=id
+      return(osm_d)
+    }
   )
 
+osm_responses<-
+  pmap(
+    list(k12$Longitude,k12$Latitude,k12$`NCES ID`),
+       ~get_nearby_osm(..1,..2,id=..3),
+       .progress = T,
+  )
+
+osm_responses|>
+  list_rbind()|>
+  mutate(
+    geo_text=st_as_text(geometry)
+  )|>
+  select(-geometry)|>
+  write_csv("foo.csv")
+       
 
 k12|>
   write_csv("foo.csv")
