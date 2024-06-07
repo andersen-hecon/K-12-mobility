@@ -19,27 +19,30 @@ college_campuses<-
   st_transform(crs=new_crs)
 
 # now get the gh list for each campus
+f0<-\(g,n) {
+  g=st_sfc(g,crs=new_crs)|>st_as_sf()|>
+    st_make_valid()
+  
+  grid<-gh_covering(g,precision = 7L)
+  
+  grid<-
+    grid|>
+    st_join(
+      g,
+      left=FALSE
+    )
+  
+  
+  gh=tibble(UNIQUEID=n,gh=grid|>rownames())
+  return(gh)
+}
+f<-purrr::possibly(f0)
 
 gh_list<-
   purrr::map2(
     college_campuses$geometry,
     college_campuses$UNIQUEID,
-    \(g,n) {
-      g=st_sfc(g,crs=new_crs)|>st_as_sf()
-      
-      grid<-gh_covering(g,precision = 7L)
-      
-      grid<-
-        grid|>
-        st_join(
-          g,
-          left=FALSE
-        )
-      
-      
-      gh=tibble(UNIQUEID=n,gh=grid|>rownames())
-      return(gh)
-    },
+    ~f(.x,.y),
     .progress = T
   )|>
   list_rbind()
