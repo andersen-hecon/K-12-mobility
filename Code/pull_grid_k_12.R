@@ -5,6 +5,93 @@ library(geohashTools)
 library(osmdata)
 library(furrr)
 
+# get a list of boxes of interst
+usa<-tigris::states(cb=TRUE)|>
+  filter(STATEFP<=56)|>
+  summarise(
+    do_union=TRUE
+  )
+
+bb0=st_bbox(usa)
+
+d=2.5
+bb=d*floor(bb0/d)
+
+usa_grid<-
+  st_make_grid(usa,cellsize=c(d,d),offset = bb[1:2])|>
+  st_as_sf()|>
+  st_join(
+    usa,
+    left=FALSE
+  )|>
+  mutate(bb=map(x,~st_bbox(.)))
+
+
+w=c(state.name,"Washington, DC")
+
+names(w)=w
+
+data<-
+  map(
+  usa_grid$bb,
+  \(n){
+    opq(n,timeout = 600)|>
+      add_osm_features(features=list("building"="school","amenity"="school"))|>
+      osmdata_sf()|>
+      unique_osmdata()|>
+      enframe()|>
+      filter(
+        map_lgl(value,~"data.frame" %in% class(.)),
+        str_detect(name,"polygon")
+      )|>
+      as_tibble()%>%
+      .$value|>
+      map(
+        ~as_tibble(.)|>
+          st_set_geometry("geometry")
+      )
+  },
+  .progress=T
+  )
+
+data2<-
+  map(
+    data,
+    \(d) {
+      d=if(length(d)>1) list_rbind(d)
+      else d[[1]]
+      
+    })|>
+  list_rbind()
+
+data2|>
+  write_csv("Data/osm_extract.csv.gz")
+
+map_dfr(
+  names(data2),
+  \(n){
+  en=sym(n)
+  data2|>
+    count(check=is.na(!!en))|>
+    mutate(name=!!n)|>
+    mutate(p=prop.table(n))
+  }
+)
+  
+
+
+
+
+data|>map(
+  ~
+  )
+
+|>
+  list_rbind()
+
+
+
+
 xy_precision=2*gh_delta(7L)
 
 k12=readr::read_csv("./Input-Data/Public_Schools_-7669544197405643438.csv")
