@@ -5,6 +5,95 @@ library(geohashTools)
 library(osmdata)
 library(furrr)
 
+
+school_coords<-
+  bind_rows(
+    read_csv("Input-Data/NCES_public_schools_2019_2020.csv")|>select(NCESSCH,LEAID,NAME,LAT,LON),
+    read_csv("Input-Data/NCES_private_schools_2019_2020.csv")|>select(PPIN,NAME,LAT,LON)
+  )
+
+school_coords$gh=gh_encode(school_coords$LAT,school_coords$LON,precision = 7L)
+
+# construct the neighbors
+matrix=
+  bind_rows(
+    tibble_row(dir="ne",d_lat= 2,d_lon= 2),
+    tibble_row(dir="n" ,d_lat= 2,d_lon= 0),
+    tibble_row(dir="nw",d_lat= 2,d_lon=-2),
+    tibble_row(dir="se",d_lat=-2,d_lon= 2),
+    tibble_row(dir="s" ,d_lat=-2,d_lon= 0),
+    tibble_row(dir="sw",d_lat=-2,d_lon=-2),
+    tibble_row(dir= "e",d_lat= 0,d_lon= 2),
+    tibble_row(dir= "w",d_lat= 0,d_lon=-2),
+    
+    # now do the second ring
+    tibble_row(dir="ne2",d_lat= 4,d_lon= 4),
+    tibble_row(dir="nne",d_lat= 4,d_lon= 2),
+    tibble_row(dir="nn2",d_lat= 4,d_lon= 0),
+    tibble_row(dir="nnw",d_lat= 4,d_lon=-2),
+    tibble_row(dir="nw2",d_lat= 4,d_lon=-4),
+    tibble_row(dir="ene",d_lat= 2,d_lon= 4),
+    tibble_row(dir="wnw",d_lat= 2,d_lon=-4),
+    
+    tibble_row(dir="ee2",d_lat= 0,d_lon= 4),
+    tibble_row(dir="ww2",d_lat= 0,d_lon=-4),
+    
+    tibble_row(dir="se2",d_lat=-4,d_lon= 4),
+    tibble_row(dir="sse",d_lat=-4,d_lon= 2),
+    tibble_row(dir="ss2",d_lat=-4,d_lon= 0),
+    tibble_row(dir="ssw",d_lat=-4,d_lon=-2),
+    tibble_row(dir="sw2",d_lat=-4,d_lon=-4),
+    tibble_row(dir="ese",d_lat=-2,d_lon= 4),
+    tibble_row(dir="wsw",d_lat=-2,d_lon=-4),
+    
+    tibble_row(dir="c",d_lat=0,d_lon=0),
+  )
+
+get_neighbors<-\(lat,lon, precision) {
+  delta=gh_delta(precision)
+  
+  matrix|>
+    mutate(
+      lat=lat+d_lat*delta[[2]],
+      lon=lon+d_lon*delta[[2]],
+    )|>
+    mutate(
+      gh=gh_encode(lat,lon,precision)
+    )|>
+    select(name=dir,value=gh)|>
+    pivot_wider(names_prefix="neighbor_")
+}
+
+delta=gh_delta(7L)
+
+# school_coords<-
+  school_coords|>
+    filter(str_detect(NAME,"Grimsley"))|>
+  cross_join(matrix)|>
+  mutate(neighbor_gh=gh_encode(LAT+d_lat*delta[[2]],
+                             LON+d_lon*delta[[2]],
+                             7L)
+  )|>
+  select(-d_lat,-d_lon,-gh,gh=neighbor_gh)|>
+    gh_to_sf()|>ggplot()+ggspatial::annotation_map_tile()+geom_sf(fill=NA)
+    
+  pivot_wider(names_from=dir,values_from = neighbor_gh, names_prefix = "neighbor_")
+  
+  
+  rowwise()|>
+  reframe(
+    get_neighbors(LAT,LON,7L)
+  )
+
+
+
+
+
+
+
+
+
+
 # get a list of boxes of interst
 usa<-tigris::states(cb=TRUE)|>
   filter(STATEFP<=56)|>
@@ -273,12 +362,67 @@ get_osm_nearby<-purrr::possibly(
   }
 )
   
+process_geom<-purrr::possibly(
+  \(g) {
+    g_sf<-
+      st_sfc(g, crs=st_crs("WGS84"))|>
+      st_as_sf()|>
+      st_make_valid()
+    
+    bb=st_bbox(g_sf)
+    
+    bb[1:2]=floor(bb[1:2]/gh_precision)*gh_precision
+    bb[3:4]=ceiling(bb[3:4]/gh_precision)*gh_precision
+    
+    bb_sf=st_as_sfc(bb)|>st_set_crs(st_crs("WGS84"))
+    grid=st_make_grid(bb_sf,gh_precision)|>st_as_sf()
+    
+    grid<-
+      grid|>
+      # rowwise()|>
+      mutate(
+        c=st_coordinates(st_centroid(x)),
+        # gh=gh_encode(c[2],c[1],precision=7L)
+      )
+    
+    grid$gh=gh_encode(grid$c[,2],grid$c[,1],precision=7L)
+    
+    grid|>
+      st_join(
+        g_sf
+      )|>
+      st_drop_geometry()|>
+      select(gh)
+  }
+)
 
-unmatched|>
+unmatched2=unmatched|>
   mutate(
     zz=map2(X,Y,
             ~get_osm_nearby(.x,.y))
   )
+
+
+
+write_rds(unmatched2,"foo.rds")
+
+unmatched2|>
+  mutate(gh=~process_geom())
+
+
+unmatched2|>
+  mutate(
+    zz=map(
+      zz,
+      \(d) {
+        if(inherits(d,"tbl")) return(d)
+        
+        
+      }
+    )
+  )
+
+unmatched2$zz[[456]]|>list_rbind()
 
 
 zzz|>
@@ -329,39 +473,7 @@ um<-
 
 #get geometry info
 
-process_geom<-purrr::possibly(
-  \(g) {
-    g_sf<-
-      st_sfc(g, crs=st_crs("WGS84"))|>
-      st_as_sf()|>
-      st_make_valid()
-    
-    bb=st_bbox(g_sf)
-    
-    bb[1:2]=floor(bb[1:2]/gh_precision)*gh_precision
-    bb[3:4]=ceiling(bb[3:4]/gh_precision)*gh_precision
-    
-    bb_sf=st_as_sfc(bb)|>st_set_crs(st_crs("WGS84"))
-    grid=st_make_grid(bb_sf,gh_precision)|>st_as_sf()
-    
-    grid<-
-      grid|>
-      # rowwise()|>
-      mutate(
-        c=st_coordinates(st_centroid(x)),
-        # gh=gh_encode(c[2],c[1],precision=7L)
-      )
-    
-    grid$gh=gh_encode(grid$c[,2],grid$c[,1],precision=7L)
-    
-    grid|>
-      st_join(
-        g_sf
-      )|>
-      st_drop_geometry()|>
-      select(gh)
-  }
-)
+
 
 # sf_use_s2(T)
 gh_list<-
