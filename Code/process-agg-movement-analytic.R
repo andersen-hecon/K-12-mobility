@@ -1,11 +1,12 @@
 library(tidyverse)
+library(tidylog)
 library(arrow)
 
 
 # get the school status datasets
 
 dates=tibble(date=
-               seq(from=floor_date(as_date("2020-07-01"),"week",week_start = 1),
+               seq(from=floor_date(as_date("2019-07-01"),"week",week_start = 1),
                    to  =floor_date(as_date("2021-07-01")-1,"week",week_start = 1),
                    by=7)
              )|>
@@ -108,7 +109,7 @@ Burbio<-
          Burbio_status_now=case_when(`SD %V`>pmax(`SD %U`, `SD %T`, `SD %H`)~"R",
                                      `SD %H`>pmax(`SD %U`, `SD %T`, `SD %V`)~"H",
                                      `SD %T`>pmax(`SD %U`, `SD %V`, `SD %H`)~"I"),
-         year=year(date))%>%
+         year=year(date))|>
   filter(`County Population`==max(`County Population`),.by=c(leaid,date))|>
   select(date, Burbio_status_now,Burbio_start_date,leaid,year)|>
   group_by(leaid)|>
@@ -174,7 +175,16 @@ schools<-
   fill(R2L_start_date:Burbio_status_now,.direction = "downup")|>
   ungroup()|>
   distinct()
-  
+
+# now just fill in the 2019 data
+schools<-
+  schools|>
+  group_by(leaid)|>
+  arrange(date, .by_group = TRUE)|>
+  fill(R2L_start_date:Burbio_status_now,.direction = "downup")|>
+  ungroup()|>
+  distinct()
+
 schools|>
   select(leaid,year,date,contains("start_date"),contains("status_start"),contains("status_now"))|>
   write_csv("Data/school_policies.csv")
@@ -316,8 +326,13 @@ gc()
 
 schools<-read_csv("Data/school_policies.csv")
 
-mobility<-read_csv("Data/mobility-2019-2021.csv.gz")
+schools<-
+  schools|>
+  mutate(
+    across(contains("date"),~floor_date(.,unit="week",week_start=1))
+  )
 
+mobility<-read_csv("Data/mobility-2019-2021.csv.gz")
 
 analytic<-
   mobility|>
@@ -350,7 +365,8 @@ analytic<-
   inner_join(
     schools,
     by=join_by(leaid,week_date==date),
-  )
+  )|>
+  rename(data_year=year)
 
 analytic<-
   analytic|>
@@ -396,10 +412,57 @@ analytic<-
   mutate(month=month(week_date),
          year=year(week_date),
          county_fips=as.numeric(county_fips))|>
-  inner_join(LAU_data)
+  left_join(LAU_data)|>
+  select(-month,-year)
 
 rm(LAU_data)
 
+
+
+# get USAFacts data
+usafacts_data<-
+  read_csv("https://static.usafacts.org/public/data/covid-19/covid_confirmed_usafacts.csv")
+
+usafacts_data<-
+  usafacts_data|>
+  select(-`County Name`,-State)|>
+  rename(county_fips=countyFIPS,state_fips=StateFIPS)|>
+  filter(county_fips!=0 & county_fips>=1001 & county_fips<57000)|>
+  mutate(state_fips=as.numeric(state_fips))|>
+  pivot_longer(-c(county_fips,state_fips),names_to="date",values_to="cum_usafacts_cases")|>
+  mutate(date=lubridate::as_date(date))
+
+
+usafacts_pop<-
+  read_csv("https://static.usafacts.org/public/data/covid-19/covid_county_population_usafacts.csv")
+
+usafacts_pop<-
+  usafacts_pop|>
+  select(county_fips=countyFIPS,postal=State,population)|>
+  filter(county_fips!=0,county_fips<57000)
+
+
+# line up to the weekly data
+usafacts_weekly<-
+  analytic|>
+  distinct(week_date)|>
+  inner_join(usafacts_data, by=join_by(week_date==date))|>
+  mutate(weekly_cases=cum_usafacts_cases-lag(cum_usafacts_cases,n=1,default=0,order_by=week_date),.by=county_fips)
+
+# convert to population-based
+usafacts_weekly<-
+  usafacts_weekly|>
+  inner_join(usafacts_pop)|>
+  mutate(weekly_cases_per100k=weekly_cases/(population/100000))|>
+  select(county_fips,week_date,weekly_cases_per100k)
+
+analytic<-
+  analytic|>
+  inner_join(usafacts_pop)|>
+  left_join(usafacts_weekly)|>
+  mutate(weekly_cases_per100k=replace_na(weekly_cases_per100k,0))
+
+rm(usafacts_data,usafacts_pop,usafacts_weekly)
 
 analytic|>
   write_csv("Data/mobility-analytic.csv.gz")
