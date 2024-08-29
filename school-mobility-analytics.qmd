@@ -1,0 +1,1067 @@
+---
+output:
+  pdf_document: 
+    keep_tex: yes
+  html_document: default
+---
+
+<!-- # to do list -->
+<!-- 1. Get the switching right -->
+<!-- 6. Leaving home behavior -->
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,error = TRUE, cache.lazy = FALSE)
+library(tidyverse)
+library(lubridate)
+library(fixest)
+library(modelsummary)
+library(did)
+library(DIDmultiplegt)
+library(patchwork)
+library(collapse)
+library(doParallel)
+
+```
+
+```{r load-data, cache=TRUE, cache.path="school-mobility_cache/", cache.extra=tools::md5sum("../Final data/weekly_patterns_hourly.csv.gz")}
+
+demo<-
+  map_dfr(
+    list.files("Input-Data/nhgis0047_csv", pattern = "csv", full.names = TRUE),
+    ~read_csv(.)
+    )
+
+demo<-
+  demo|>
+  select(-matches("M[0-9]{3}$"))
+
+
+demo<-
+  demo|>
+  mutate(
+    pct_00_04=(ALT0E003+ALT0E027)/ALT0E001,
+    pct_05_09=(ALT0E004+ALT0E028)/ALT0E001,
+    pct_10_14=(ALT0E005+ALT0E029)/ALT0E001,
+    pct_15_17=(ALT0E006+ALT0E030)/ALT0E001,
+    
+    pct_hispanic=ALUKE012/ALUKE001,
+    pct_nh_white=ALUKE003/ALUKE001,
+    pct_nh_black=ALUKE004/ALUKE001,
+    pct_nh_other=(ALUKE002-ALUKE003-ALUKE004)/ALUKE001,
+    
+    pct_fpl_000_049=ALWVE002/ALWVE001,
+    pct_fpl_050_099=ALWVE003/ALWVE001,
+    pct_fpl_100_124=ALWVE004/ALWVE001,
+    pct_fpl_125_149=ALWVE005/ALWVE001,
+    pct_fpl_150_184=ALWVE006/ALWVE001,
+    pct_fpl_185_199=ALWVE007/ALWVE001,
+    pct_fpl_200_999=ALWVE008/ALWVE001,
+    
+    
+    percapita_income=ALX5E001,
+
+    )|>
+  mutate(
+    pct_fpl_000_099=pct_fpl_000_049+pct_fpl_050_099,
+    pct_fpl_100_199=pct_fpl_100_124+pct_fpl_125_149+pct_fpl_150_184+pct_fpl_185_199,
+    pct_05_17=pct_05_09+pct_10_14+pct_15_17,
+        
+    pct_internet=1-AL1YE013/AL1YE001,
+    pct_computer=AL1ZE002/AL1ZE001
+  )
+
+demo<-
+  demo|>
+  mutate(county_fips=as.numeric(paste0(STATEA,COUNTYA)),
+         leaid=case_when(
+           !is.na(SDELMA)~paste0(STATEA,SDELMA),
+           !is.na(SDSECA)~paste0(STATEA,SDSECA),
+           !is.na(SDUNIA)~paste0(STATEA,SDUNIA),
+         ),
+         leaid=as.numeric(leaid)
+         )|>
+  select(county_fips,leaid,pct_00_04:pct_computer)
+
+# k12_enrollment<-
+#   read_csv("Input-Data/k12_enrollment.csv")
+# 
+# k12_enrollment<-
+#   k12_enrollment|>
+#   mutate(across(c(leaid,enrollment),~as.numeric(.)))|>
+#   drop_na()
+
+mobility<-
+  read_csv("Data/mobility-analytic.csv.gz")
+
+analytic<-
+  mobility|>
+  summarize(
+    across(c(scaled_days_visited,scaled_visitors,
+             days_visited,visitors),
+           ~sum(.,na.rm=T)),
+    .by=c(week_date,type,leaid,county_fips)
+  )|>
+  pivot_wider(
+    names_from = type,
+    values_from = c(scaled_days_visited,scaled_visitors,
+             days_visited,visitors),
+    names_glue = "{type}_{.value}"
+  )|>
+  inner_join(
+    mobility|>
+      select(week_date,leaid,county_fips,R2L_start_date:Burbio_status_start)|>
+      distinct()
+  )|>
+  # inner_join(select(k12_enrollment,leaid,enrollment))|>
+  mutate(across(c(R2L_start_date,Burbio_start_date),~if_else(is.na(MCH_start_date),.,MCH_start_date)),
+         R2L_open=case_when(is.na(R2L_start_date) | year(week_date)!=year(R2L_start_date)~NA_real_,
+                            week_date>=R2L_start_date~1,
+                            week_date<R2L_start_date~0),
+         MCH_open=case_when(is.na(MCH_start_date) | year(week_date)!=year(MCH_start_date)~NA_real_,
+                            week_date>=MCH_start_date~1,
+                            week_date<MCH_start_date~0),
+         Burbio_open=case_when(is.na(Burbio_start_date) | year(week_date)!=year(Burbio_start_date)~NA_real_,
+                               week_date>=Burbio_start_date~1,
+                               week_date<Burbio_start_date~0),
+         )
+
+LAU_data<-
+  read_tsv("Input-Data/la.data.0.CurrentU20-24.txt")|>
+  inner_join(read_tsv("Input-Data/la.series.txt"), by="series_id")|>
+  inner_join(read_tsv("Input-Data/la.area.txt"), by=c("area_code", "area_type_code"))
+
+LAU_data<-
+  LAU_data|>
+  filter(area_type_code=="F")|>
+  select(area_code,year,month=period,value,measure_code)|>
+  mutate(measure=case_when(measure_code=="03"~"unemployment_rate",
+                           measure_code=="04"~"unemployment",
+                           measure_code=="05"~"employment",
+                           measure_code=="06"~"labor_force",
+                           measure_code=="07"~"employment-population ratio",
+                           measure_code=="08"~"labor force participation rate",
+                           measure_code=="09"~"civilian noninstitutional population",
+                           TRUE~measure_code),
+         month=as.numeric(str_extract(month,"[0-9]+")),
+         county_fips=as.numeric(str_sub(area_code,3,7)),
+         value=as.numeric(value))|>
+  select(-area_code,-measure_code)|>
+  filter(month %in% 1:12, county_fips<57000)|>
+  pivot_wider(names_from=measure,values_from = value)
+
+analytic<-
+  analytic|>
+  mutate(month=month(week_date),
+         year=year(week_date),
+         county_fips=as.numeric(county_fips))|>
+  inner_join(LAU_data)
+  
+rm(LAU_data)
+
+
+# now bring in the demographic information, start with LEA and then get the county if necessary
+demo_map<-
+  analytic|>
+  distinct(leaid,county_fips)
+
+demo_merged<-
+  inner_join(demo_map,select(demo,-county_fips),by="leaid")
+
+demo_merged<-
+  demo_map|>
+  anti_join(demo_merged)|>
+  inner_join(select(demo,-leaid),by="county_fips")|>
+  bind_rows(demo_merged)
+# 
+# analytic<-
+#   analytic|>
+#   left_join(demo_merged)
+#     
+# estimate DID models with pairwise comparisons, define a T group and a C-group, restrict to observations that are C or T, but not not C and T
+
+types=c("R","H","I")
+
+pairwise_comps<-
+  tibble(T_type=types)|>
+  inner_join(tibble(C_type=types),by=character())
+
+# now set up a dataset for DID estimation
+DID_base_data_wide<-
+  analytic|>
+  distinct(county_fips,leaid,year)|>
+  mutate(group_id=row_number())|>
+  inner_join(analytic)|>
+  mutate(
+    across(
+      c(ends_with("visited") | ends_with("visitors"),unemployment,employment,labor_force),
+      ~replace_na(.,0)
+      ),
+    across(
+      c(ends_with("visited") | ends_with("visitors"),unemployment,employment,labor_force),
+      ~asinh(replace_na(.,0)),.names="log_{col}"
+      )
+    )|>
+  select(group_id,date=week_date,leaid,county_fips,year,
+         log_public_scaled_days_visited, log_restaurant_scaled_days_visited, log_cafe_scaled_days_visited, log_bar_scaled_days_visited, log_library_scaled_days_visited, log_private_scaled_days_visited,
+         log_public_days_visited, log_restaurant_days_visited, log_cafe_days_visited, log_bar_days_visited, log_library_days_visited, log_private_days_visited, log_public_scaled_visitors, 
+         log_restaurant_scaled_visitors, log_cafe_scaled_visitors, log_bar_scaled_visitors, log_library_scaled_visitors, log_private_scaled_visitors, log_public_visitors, log_restaurant_visitors, 
+         log_cafe_visitors, log_bar_visitors, log_library_visitors, log_private_visitors, log_unemployment, log_employment, log_labor_force,
+         public_days_visited,private_days_visited,bar_days_visited,cafe_days_visited,library_days_visited,restaurant_days_visited,unemployment,employment,labor_force,
+         starts_with("R2L"),
+         starts_with("MCH"),
+         starts_with("Burbio"),
+         )|>
+  mutate(across(contains("date"),~floor(as.numeric(.)/7),.names="{col}"))|>
+  pivot_longer(contains("R2L") | contains("MCH") | contains("Burbio"),names_to = c("vendor",".value"),names_pattern = "([A-Z|a-z|2]+)_(.*)")|>
+  distinct()|>
+  filter(!is.na(start_date))
+  
+
+DID_base_data_long<-
+  DID_base_data_wide|>
+  select(-public_days_visited,-private_days_visited,-bar_days_visited,-cafe_days_visited,-library_days_visited,-restaurant_days_visited,-unemployment,-employment,-labor_force)|>
+  pivot_longer(
+    c(log_public_scaled_days_visited, log_restaurant_scaled_days_visited, log_cafe_scaled_days_visited, log_bar_scaled_days_visited, log_library_scaled_days_visited, log_private_scaled_days_visited,
+      log_public_days_visited, log_restaurant_days_visited, log_cafe_days_visited, log_bar_days_visited, log_library_days_visited, log_private_days_visited, log_public_scaled_visitors, 
+      log_restaurant_scaled_visitors, log_cafe_scaled_visitors, log_bar_scaled_visitors, log_library_scaled_visitors, log_private_scaled_visitors, log_public_visitors, log_restaurant_visitors, 
+      log_cafe_visitors, log_bar_visitors, log_library_visitors, log_private_visitors,
+      log_unemployment,log_employment,log_labor_force),names_to="depvar",values_to="Y")|>
+  filter(!is.na(Y),is.finite(Y),
+         !is.na(start_date))|>
+  mutate(relative_time=date-start_date)
+
+# remove groups that would be removed later on
+DID_base_data_long<-
+  DID_base_data_long|>
+  filter(mean(Y)>0,.by=c(leaid,county_fips,year,depvar))
+
+
+DID_base_data_long<-
+  DID_base_data_long|>
+  inner_join(demo_merged)
+
+# weights<-
+#   DID_base_data_long|>
+#   distinct(leaid,county_fips,year,vendor,enrollment,depvar)|>
+#   group_by(county_fips,vendor,depvar)|>
+#   mutate(weight=case_when(depvar %in% c("log_raw_visit_counts","log_raw_visitor_counts")~1,
+#                           TRUE~enrollment/sum(enrollment)))|>
+#   ungroup()
+# 
+# DID_base_data_long<-
+#   DID_base_data_long|>
+#   inner_join(weights)
+
+
+```
+
+```{r select-horse-races, cache=TRUE, dependson='load-data', errors=FALSE}
+MCH_R2L_horse_race_sample<-
+  analytic|>
+  filter(!is.na(R2L_status_start),!is.na(MCH_status_start),!is.na(R2L_open),!is.na(MCH_open))|>
+  distinct(leaid,county_fips,year)
+
+Burbio_MCH_R2L_horse_race_sample<-
+  analytic|>
+  filter(!is.na(R2L_status_start),!is.na(R2L_open),
+         !is.na(MCH_status_start),!is.na(MCH_open),
+         !is.na(Burbio_status_start),!is.na(Burbio_open),
+         )|>
+  distinct(leaid,county_fips,year)
+
+
+```
+
+```{r define-honest-func}
+# library(HonestDiD)
+# 
+# est_honest_did <- function(es,
+#                            e=0,
+#                            type=c("smoothness", "relative_magnitude"),
+#                            method=NULL,
+#                            bound="deviation from parallel trends",
+#                            Mvec=NULL,
+#                            Mbarvec=NULL,
+#                            monotonicityDirection=NULL,
+#                            biasDirection=NULL,
+#                            alpha=0.05,
+#                            parallel=FALSE,
+#                            gridPoints=10^3,
+#                            grid.ub=NA,
+#                            grid.lb=NA,
+#                            ...) {
+#   
+#   # pb$tick()$print()
+#   tryCatch(
+#     {
+#       type <- type[1]
+#       
+#       # make sure that user is passing in an event study
+#       if (es$type != "dynamic") {
+#         stop("need to pass in an event study")
+#       }
+#       
+#       # check if used universal base period and warn otherwise
+#       if (es$DIDparams$base_period != "universal") {
+#         warning("it is recommended to use a universal base period for honest_did")
+#       }
+#       
+#       # recover influence function for event study estimates
+#       es_inf_func <- es$inf.function$dynamic.inf.func.e
+#       
+#       # recover variance-covariance matrix
+#       n <- nrow(es_inf_func)
+#       V <- t(es_inf_func) %*% es_inf_func / (n*n) 
+#       
+#       # get anticipation
+#       a=es$DIDparams$anticipation
+#       
+#       nperiods <- nrow(V)
+#       npre <- sum(1*(es$egt + a< 0))
+#       npost <- nperiods - npre
+#       
+#       baseVec1 <- basisVector(index=(a+e+1),size=npost)
+#       
+#       orig_ci <- constructOriginalCS(betahat = es$att.egt,
+#                                      sigma = V, numPrePeriods = npre,
+#                                      numPostPeriods = npost,
+#                                      l_vec = baseVec1)
+#       
+#       if (type=="relative_magnitude") {
+#         if (is.null(method)) method <- "C-LF"
+#         robust_ci <- createSensitivityResults_relativeMagnitudes(betahat = es$att.egt, sigma = V, 
+#                                                                  numPrePeriods = npre, 
+#                                                                  numPostPeriods = npost,
+#                                                                  bound=bound,
+#                                                                  method=method,
+#                                                                  l_vec = baseVec1,
+#                                                                  Mbarvec = Mbarvec,
+#                                                                  monotonicityDirection=monotonicityDirection,
+#                                                                  biasDirection=biasDirection,
+#                                                                  alpha=alpha,
+#                                                                  gridPoints=100,
+#                                                                  grid.lb=-1,
+#                                                                  grid.ub=1,
+#                                                                  parallel=parallel)
+#         
+#       } else if (type=="smoothness") {
+#         robust_ci <- createSensitivityResults(betahat = es$att.egt,
+#                                               sigma = V, 
+#                                               numPrePeriods = npre, 
+#                                               numPostPeriods = npost,
+#                                               method=method,
+#                                               l_vec = baseVec1,
+#                                               monotonicityDirection=monotonicityDirection,
+#                                               biasDirection=biasDirection,
+#                                               alpha=alpha,
+#                                               parallel=parallel)
+#       }
+#       
+#       return(list(robust_ci=robust_ci, orig_ci=orig_ci, type=type))
+#     },
+#     error=function(cond){
+#       return(list("error"=cond))
+#     }
+#   )
+# }
+
+```
+
+```{r estimate-DIDs, cache=TRUE, dependson='load-data', errors=FALSE}
+base_DID=DID_base_data_long|>distinct(leaid,county_fips,year,status_start,vendor,depvar,start_date)
+
+DID_datasets<-
+  bind_rows(
+    base_DID|>mutate(districts="All"),
+    base_DID|>mutate(districts="MCH_R2L")|>inner_join(MCH_R2L_horse_race_sample),
+    base_DID|>mutate(districts="Burbio_MCH_R2L")|>inner_join(Burbio_MCH_R2L_horse_race_sample)
+  )
+# 
+# 
+# |>
+#   select(-status_now)|>
+#   drop_na()|>
+#   group_by(vendor,depvar,districts)|>
+#   nest()
+
+# DID_datasets<-
+#   DID_datasets|>
+#   filter(case_when(districts=="All"~TRUE,
+#                    depvar %in% c("log_raw_visit_counts","log_raw_visitor_counts","weekly_cases_per100k")~TRUE,
+#                    TRUE~FALSE
+#                    ))
+
+DID_datasets<-
+  pairwise_comps|>
+  cross_join(DID_datasets)|>
+  filter(status_start==T_type | status_start==C_type,year==2020)|>
+  mutate(
+    treat=if_else(status_start==T_type,start_date,0),
+    treat_g=1L*(status_start==T_type)
+    )
+
+
+
+
+
+
+DID_datasets
+dates=distinct(DID_base_data_long,date)
+
+twfe_results<-
+  DID_datasets|>
+  # filter(depvar=="log_public_scaled_days_visited",T_type!=C_type)|>
+  group_by(T_type,C_type,vendor,depvar)|>
+  group_modify(
+    \(x,y) {
+      x0=x|>
+        cross_join(y)|>
+        cross_join(dates)|>
+        inner_join(DID_base_data_long)
+
+
+
+      tibble(
+        twfe_DD=feols(Y~treat_g*open|group_id+date,data=x0, lean = T, cluster=~county_fips)|>broom::tidy()|>list(),
+        twfe_event=feols(Y~i(relative_time,treat_g,ref=-2)|group_id+date,data=x0, lean = T, cluster=~county_fips)|>broom::tidy()|>list()
+      )
+    }
+  )
+
+
+cs_did_func<-
+  purrr::partial(att_gt,
+                 yname="Y",
+                 tname="date",
+                 idname="group_id",
+                 gname="treat",
+                 control_group = "notyettreated",
+                 base_period = "universal",
+                 xformla = ~pct_00_04+pct_05_09+pct_10_14+pct_15_17+pct_hispanic+pct_nh_black+pct_nh_other
+                            +pct_fpl_000_049+pct_fpl_050_099+pct_fpl_100_124+pct_fpl_125_149+pct_fpl_150_184
+                            +pct_fpl_185_199+pct_internet+pct_computer,
+                 anticipation = 2,
+                 clustervars = "group_id",
+                 # weightsname = "weight"
+                 )
+
+
+
+
+
+
+
+
+
+
+DID_datasets$DIDs=map(DID_datasets$data,
+                           ~att_gt(data=.,
+                                   yname="Y",
+                                   tname="date",
+                                   idname="group_id",
+                                   gname="treat",
+                                   control_group = "notyettreated",
+                                   base_period = "universal",
+                                   xformla = ~pct_00_04+pct_05_09+pct_10_14+pct_15_17
+                                            +pct_hispanic+pct_nh_black+pct_nh_other
+                                            +pct_fpl_000_049+pct_fpl_050_099+pct_fpl_100_124
+                                            +pct_fpl_125_149+pct_fpl_150_184+pct_fpl_185_199
+                                            +pct_internet+pct_computer,
+                                   anticipation = 2,
+                                   clustervars = "group_id",
+                                   # weightsname = "weight"
+                                   )
+                           )
+
+# DID_datasets$universalDIDs=map(DID_datasets$data,
+#                                ~att_gt(data=.,
+#                                        yname="Y",
+#                                        tname="date",
+#                                        idname="group_id",
+#                                        gname="treat",
+#                                        control_group = "notyettreated",
+#                                        base_period = "universal",
+#                                        anticipation = 2,
+#                                        clustervars = "group_id",
+#                                        weightsname = "weight")
+#                                )
+
+    
+DID_datasets<-
+  DID_datasets|>
+  select(-data)
+
+
+DID_datasets$ATTs  =map(DID_datasets$DIDs,~aggte(.,min_e = -8,max_e=7,na.rm = TRUE))
+DID_datasets$events=map(DID_datasets$DIDs,~aggte(.,min_e = -8,max_e=7,na.rm = TRUE,type="dynamic"))
+# 
+# DID_datasets$universal_events=map(DID_datasets$universalDIDs,~aggte(.,min_e = -8,max_e=7,na.rm = TRUE,type="dynamic"))
+DID_datasets|>saveRDS("base_DIDs2.RDS")
+```
+
+```{r estimate-honest, cache=TRUE, dependson='estimate-DIDs'}
+# 
+# pb <- progress_estimated(length(DID_datasets$universal_events))
+# 
+# registerDoParallel(cores=8)
+# DID_datasets$honest_did=
+#   map(DID_datasets$universal_events,~est_honest_did(.,type="smoothness",e=0,parallel = TRUE))
+# stopImplicitCluster()
+# DID_datasets|>saveRDS("base_DIDs.RDS")
+```
+
+
+```{r estimate-twfe, cache=TRUE, dependson='load-data', cache.lazy=FALSE}
+# Estimate horse race models
+## Choose sample
+
+
+horse_races<-
+  fixest::fepois(c((raw_visit_counts),(raw_visitor_counts))~sw(open:status_start,open:status_now)
+                 |leaid^county_fips+date,
+                 data=inner_join(DID_base_data_wide,MCH_R2L_horse_race_sample)|>mutate(status_now=if_else(is.na(status_now),status_start,status_now))
+                 ,panel.id = ~leaid^county_fips,cluster=~leaid+date,
+                 split=~vendor)
+
+# Estimate TWFE effects
+## construct weights for county-level variables
+weights<-
+  DID_base_data_wide|>
+  distinct(leaid,county_fips,year,vendor,enrollment)|>
+  group_by(county_fips,vendor)|>
+  mutate(weight=enrollment/sum(enrollment))|>
+  ungroup()|>
+  select(leaid,county_fips,year,vendor,weight)
+
+
+school_effects<-
+  fixest::fepois(c((raw_visit_counts),(raw_visitor_counts))~sw(open:status_start,open:status_now)
+                 |leaid^county_fips+date,
+                 data=DID_base_data_wide|>mutate(status_now=if_else(is.na(status_now),status_start,status_now))
+                 ,panel.id = ~leaid^county_fips,cluster=~leaid+date,
+                 split=~vendor)
+
+
+school_effects2<-
+  fixest::fepois(c(Bar_visits,Library_visits,Restaurant_visits,
+                   unemployment,employment,labor_force, 
+                   pmax(0,weekly_cases_per100k))~sw(open:status_start,open:status_now)
+                 |leaid^county_fips+date,
+                 data=DID_base_data_wide|>
+                   mutate(status_now=if_else(is.na(status_now),status_start,status_now))|>
+                   inner_join(weights)
+                 ,panel.id = ~leaid^county_fips,cluster=~leaid+date,
+                 weights = ~weight,
+                 split=~vendor)
+```
+
+```{r event-studies, cache=TRUE, dependson='estimate-DIDs'}
+DID_data<-
+  DID_datasets|>
+  mutate(order=case_when(T_type=="I"~1,
+                         T_type=="H"~2,
+                         T_type=="R"~3))|>
+  mutate(dorder=case_when(depvar=="log_raw_visit_counts"~1,
+                          depvar=="log_raw_visitor_counts"~2,
+                          depvar=="weekly_cases_per100k"~3,
+                          depvar=="log_Bar_visits"~4,
+                          depvar=="log_Restaurant_visits"~5,
+                          depvar=="log_Library_visits"~6,
+                          depvar=="log_Museum_visits"~7,
+                          depvar=="log_labor_force"~8,
+                          depvar=="log_employment"~9,
+                          depvar=="log_unemployment"~10,
+                          ),
+         depvar=case_when(depvar=="weekly_cases_per100k"~"Weekly cases per 100,000",
+                          depvar=="log_raw_visit_counts"~"Arcsinh weekly visits",
+                          depvar=="log_raw_visitor_counts"~"Arcsinh weekly visitors",
+                          depvar=="log_Bar_visits"~"Arcsinh bar visits",
+                          depvar=="log_Restaurant_visits"~"Arcsinh restaurant visits",
+                          depvar=="log_Library_visits"~"Arcsinh library visits",
+                          depvar=="log_Museum_visits"~"Arcsinh museum visits",
+                          depvar=="log_labor_force"~"Arcsinh in the labor force",
+                          depvar=="log_employment"~"Arcinh employed",
+                          depvar=="log_unemployment"~"Arcsinh unemployed",
+                          ),
+         T_type=case_when(T_type=="I"~"In-Person",
+                          T_type=="H"~"Hybrid",
+                          T_type=="R"~"Remote")
+         )
+
+# extract data to plot the event studies
+plot_data<-
+  DID_data|>
+  mutate(events_data=list(tibble(point=events$att.egt,
+                                                 at=events$egt,
+                                                 se=events$se.egt,
+                                                 crit_val=events$crit.val.egt
+                                                 )|>
+                            mutate(ci.l=point-se*crit_val,ci.u=point+se*crit_val)|>
+                            select(-crit_val)),
+         )|>
+  unnest(events_data)
+```
+
+```{r plot-main-did-events, fig.cap="Event-study style estimates for the effect of reopening a K-12 school on mobility and COVID-19 incidence"}
+plot_data|>
+  filter(dorder<4,districts=="All")|>
+  ggplot(aes(x=at,y=point,ymax=ci.u,ymin=ci.l,color=vendor))+
+  geom_hline(yintercept = 0)+
+  geom_linerange(position = position_dodge(width=.5))+
+  geom_line(position = position_dodge(width=.5))+
+  scale_x_continuous(name="Weeks",breaks=seq(-8,8,by=4))+
+  scale_y_continuous(name="DiD coefficient")+
+  theme_minimal()+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.caption = element_text(hjust=0))+
+  facet_grid(cols=vars(reorder(T_type,order)),rows=vars(reorder(str_wrap(depvar,14),dorder)),scales = "free_y")
+```
+
+
+```{r plot-main-did-events-MCH-R2L, fig.cap="Event-study style estimates for the effect of reopening a K-12 school on mobility and COVID-19 incidence (MCH and R2L balanced sample"}
+plot_data|>
+  filter(dorder<3,districts=="MCH_R2L")|>
+  ggplot(aes(x=at,y=point,ymax=ci.u,ymin=ci.l,color=vendor))+
+  geom_hline(yintercept = 0)+
+  geom_linerange(position = position_dodge(width=.5))+
+  geom_line(position = position_dodge(width=.5))+
+  scale_x_continuous(name="Weeks",breaks=seq(-8,8,by=4))+
+  scale_y_continuous(name="DiD coefficient")+
+  theme_minimal()+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.caption = element_text(hjust=0))+
+  facet_grid(cols=vars(reorder(T_type,order)),rows=vars(reorder(str_wrap(depvar,14),dorder)),scales = "free_y")
+```
+
+```{r plot-main-did-events-Burbio-MCH-R2L, fig.cap="Event-study style estimates for the effect of reopening a K-12 school on mobility and COVID-19 incidence (Burbio, MCH and R2L balanced sample"}
+plot_data|>
+  filter(dorder<3,districts=="Burbio_MCH_R2L")|>
+  ggplot(aes(x=at,y=point,ymax=ci.u,ymin=ci.l,color=vendor))+
+  geom_hline(yintercept = 0)+
+  geom_linerange(position = position_dodge(width=.5))+
+  geom_line(position = position_dodge(width=.5))+
+  scale_x_continuous(name="Weeks",breaks=seq(-8,8,by=4))+
+  scale_y_continuous(name="DiD coefficient")+
+  theme_minimal()+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.caption = element_text(hjust=0))+
+  facet_grid(cols=vars(reorder(T_type,order)),rows=vars(reorder(str_wrap(depvar,14),dorder)),scales = "free_y")
+```
+
+
+
+```{r plot-secondary-did-events, fig.cap="Event-study style estimates for the effect of reopening a K-12 school on secondary outcomes",fig.height =9}
+plot_data|>
+  filter(dorder>=4,
+         dorder!=7,
+         districts=="All",
+         vendor!="MCH")|>
+  ggplot(aes(x=at,y=point,ymax=ci.u,ymin=ci.l,color=vendor))+
+  geom_hline(yintercept = 0)+
+  geom_linerange(position = position_dodge(width=.5))+
+  geom_line(position = position_dodge(width=.5))+
+  scale_x_continuous(name="Weeks",breaks=seq(-8,8,by=4))+
+  scale_y_continuous(name="DiD coefficient")+
+  theme_minimal()+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.caption = element_text(hjust=0))+
+  facet_grid(cols=vars(reorder(T_type,order)),rows=vars(reorder(str_wrap(depvar,10),dorder)),scales = "free")
+```
+
+```{r create-did-att}
+ATT_data<-
+  DID_data|>
+  mutate(ATTs=list(tibble(ATT=ATTs$overall.att,se=ATTs$overall.se)
+                                            ),
+                )|>
+  unnest(ATTs)|>
+  mutate(pvalue=2-2*pnorm(abs(ATT/se)),)
+
+# ATT_data|>
+#   ggplot(aes(x=reorder(T_type,order),color=vendor,shape=vendor,y=ATT,ymin=ATT-1.96*se,ymax=ATT+1.96*se))+
+#   geom_pointrange(position = position_dodge2(width=.5))+
+#   geom_hline(yintercept = 0)+
+#   scale_x_discrete(name="Teaching modality at reopening")+
+#   scale_y_continuous(name=element_blank())+
+#   theme(legend.position = "bottom",
+#         legend.title = element_blank())+
+#   facet_grid(rows=vars(reorder(str_wrap(depvar,16),dorder)),scales = "free_y")
+  
+```
+
+```{r did-att-main}
+
+tidy_custom.AGGTEobj<-function(x,...) {
+  out<-tidy(x)
+  
+  out<- data.frame(term=out$term,
+                   p.value=2-2*pnorm(abs(out$estimate/out$std.error)))
+  out
+}
+
+ms<-function(x,...){
+  x<-
+    x|>
+    mutate(label=paste(T_type))
+  models<-x$ATTs
+  names(models)<-x$label
+  
+  modelsummary(models,...)
+}
+
+rows<-
+  DID_datasets|>filter(districts=="All")|>arrange(depvar,vendor)|>split(.$depvar)|>
+  map(.,~ms(.,output="data.frame", coef_map = c("ATT(Average)"="ATT(Average)"), gof_omit = ".*", stars=TRUE))|>
+  enframe()|>
+  unnest(cols=c(value))|>
+  mutate(term=case_when(statistic=="modelsummary_tmp1"~name,TRUE~""),
+         term=case_when(term=="log_raw_visit_counts"~"School visits",
+                        term=="log_raw_visitor_counts"~"School visitors",
+                        term=="weekly_cases_per100k"~"Cases per 100k",
+                        term=="log_Bar_visits"~"Bar visits",
+                        term=="log_Library_visits"~"Library visits",
+                        term=="log_Restaurant_visits"~"Restaurant visits",
+                        term=="log_employment"~"Employed",
+                        term=="log_labor_force"~"In labor force",
+                        term=="log_unemployment"~"Unemployed",
+                        TRUE~str_replace_all(term,"_","\\\\_")
+                        ))
+```
+
+```{r output-DID-main}
+DID_datasets|>
+  arrange(depvar,vendor)|>
+  filter(depvar=="log_raw_visit_counts",
+         districts=="All")|>
+  ms(., 
+     add_rows=select(filter(rows,name %in% c("log_raw_visitor_counts","weekly_cases_per100k")),-name,-part,-statistic), coef_map = c("ATT(Average)"="Asinh visits"), gof_omit = ".*", stars=TRUE,
+            title="DID estimates of the effect of reopening by modality on main outcomes")|>
+  kableExtra::add_header_above(c("","Burbio"=3,"MCH"=3,"R2L"=3))
+```
+
+```{r output-DID-supp}
+DID_datasets|>arrange(depvar,vendor)|>filter(depvar=="log_Bar_visits", districts=="All")|>
+  ms(., 
+     add_rows=select(filter(rows,!name %in% c("log_Bar_visits","log_raw_visit_counts","log_raw_visitor_counts","weekly_cases_per100k")),-name,-part,-statistic), coef_map = c("ATT(Average)"="Asinh bar visits"), gof_omit = ".*"
+     , stars=TRUE,
+            title="DID estimates of the effect of reopening by modality on secondary outcomes")|>
+  kableExtra::add_header_above(c("","Burbio"=3,"MCH"=3,"R2L"=3))
+```
+
+```{r config-output}
+
+options("modelsummary_get" = "broom")
+
+tidy_custom.fixest_multi <- function(x, ...) {
+    s <- summary(x)$coefficients
+    out <- data.frame(
+      term = row.names(s),
+      estimate = ifelse(s[,1] > 0, '▲', '▼'))
+    return(out)
+}
+
+fitstat_register("cor2a", function(x) r2(x,"cor2"), "Squared correlation")
+
+
+
+f1 <- function(x) format(round(x, 3), big.mark=",")
+f2 <- function(x) format(round(x, 0), big.mark=",")
+gm <- list(
+  list("raw" = "nobs", "clean" = "N", "fmt" = f2),
+  list("raw"="cor2a","clean"="Squared correlation",fmt="f1"),
+  list("raw"="my","clean"="Mean of dependent variable",fmt="f1")
+  )
+
+gm <- list(
+  list("raw" = "nobs", "clean" = "N", "fmt" = f2),
+  list("raw"="cor2a","clean"="Squared correlation",fmt="f1")
+  )
+
+
+output_dict<-
+  c( "open:status_nowI"      ="In-Person", 
+     "open:status_nowH"         ="Hybrid", 
+     "open:status_nowR"         ="Remote", 
+     "open:status_startI"      ="In-Person", 
+     "open:status_startH"         ="Hybrid", 
+     "open:status_startR"         ="Remote")
+
+```
+
+<!-- # Horse race (fixed panel) regression results -->
+```{r output-horse-race-visits}
+
+mlist<-
+  list("R2L - Current"=horse_races$R2L$`(raw_visit_counts)`[rhs=2],
+       "R2L - Start"  =horse_races$R2L$`(raw_visit_counts)`[rhs=1],
+       "MCH - Start"  =horse_races$MCH$`(raw_visit_counts)`[rhs=1],
+       "Burbio - Current"=horse_races$Burbio$`(raw_visit_counts)`[rhs=2],
+       "Burbio - Start"  =horse_races$Burbio$`(raw_visit_counts)`[rhs=1]
+       )
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="Horse Race regressions - visits",
+             gof_map=gm,
+             add_rows = add_row)
+```
+
+```{r output-horse-race-visitors}
+
+mlist<-
+  list("R2L - Current"=horse_races$R2L$`(raw_visitor_counts)`[rhs=2],
+       "R2L - Start"  =horse_races$R2L$`(raw_visitor_counts)`[rhs=1],
+       "MCH - Start"  =horse_races$MCH$`(raw_visitor_counts)`[rhs=1],
+       "Burbio - Current"=horse_races$Burbio$`(raw_visitor_counts)`[rhs=2],
+       "Burbio - Start"  =horse_races$Burbio$`(raw_visitor_counts)`[rhs=1]
+       )
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="Horse Race regressions - visitors",
+             gof_map=gm,
+             add_rows = add_row)
+```
+
+<!-- # School effects regression results -->
+```{r output-school-effects-visits}
+mlist<-
+  list("R2L - Current"=school_effects$R2L$`(raw_visit_counts)`[rhs=2],
+       "R2L - Start"  =school_effects$R2L$`(raw_visit_counts)`[rhs=1],
+       "MCH - Start"  =school_effects$MCH$`(raw_visit_counts)`[rhs=1],
+       "Burbio - Current"=school_effects$Burbio$`(raw_visit_counts)`[rhs=2],
+       "Burbio - Start"  =school_effects$Burbio$`(raw_visit_counts)`[rhs=1]
+       )
+
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="School effects regressions - visits",
+             gof_map=gm,
+             add_rows =add_row)
+```
+
+
+```{r output-school-effects-visitors}
+mlist<-
+  list("R2L - Current"=school_effects$R2L$`(raw_visitor_counts)`[rhs=2],
+       "R2L - Start"  =school_effects$R2L$`(raw_visitor_counts)`[rhs=1],
+       "MCH - Start"  =school_effects$MCH$`(raw_visitor_counts)`[rhs=1],
+       "Burbio - Current"=school_effects$Burbio$`(raw_visitor_counts)`[rhs=2],
+       "Burbio - Start"  =school_effects$Burbio$`(raw_visitor_counts)`[rhs=1]
+       )
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="School effects regressions - visitors",
+             gof_map=gm,
+             add_rows =add_row)
+```
+
+```{r output-school-effects-other-current}
+
+mlist<-as.list(school_effects2$R2L[rhs=2])
+names(mlist)=c("Bar visits","Library visits","Restaurant visits","unemployment","employment","labor_force","cases")
+
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="School effects regressions - current status",
+             gof_map=gm,
+             add_rows =add_row)
+```
+
+```{r output-school-effects-other-start}
+
+mlist<-as.list(school_effects2$R2L[rhs=1])
+names(mlist)=c("Bar visits","Library visits","Restaurant visits","unemployment","employment","labor_force","cases")
+
+
+add_row<-
+  mlist|>
+  map(~fitstat(.,"cor2")|>unlist())|>
+  enframe()|>
+  unnest(cols=value)|>
+  select(-name)|>
+  mutate(value=round(value,3))|>
+  t()|>
+  cbind("Sq. Cor",.)|>
+  as.data.frame()
+
+modelsummary(mlist,coef_map=output_dict,stars=TRUE,title="School effects regressions - starting status",
+             gof_map=gm,
+             add_rows =add_row)
+```
+
+```{r pretrend-tests, cache=TRUE, depenson='estimate-DIDs'}
+
+pretrend_test<-function(ev) {
+  V=mboot(ev$inf.function$dynamic.inf.func.e,ev$DIDparams)
+  pre=ev$egt<=-3
+  preatt=ev$att.egt[pre]
+  preV=V$V[pre,pre]
+
+  W <- ev$DIDparams$n*t(preatt)%*%(solve(preV))%*%preatt
+  q <- sum(pre) # number of restrictions
+  Wpval <- 1-pchisq(W,q)
+
+  return(
+      list(W=W,
+           Wpval=Wpval,
+           df=q)
+  )
+ 
+}
+
+DID_datasets$trend_tests=map(DID_datasets$events,~pretrend_test(.))
+
+
+DID_datasets<-
+  DID_datasets|>
+  unnest_wider(col=trend_tests)
+```
+
+```{r output-pretrends}
+
+DID_datasets|>
+  filter(districts=="All")|>
+  datasummary(depvar*(W+Wpval+df)~Mean*vendor*T_type,data=.)|>
+  knitr::kable(caption="Pre-trend tests")
+```
+
+```{r correlation-matrix}
+corr_data<-
+  DID_base_data_wide|>
+  distinct()|>
+  filter(year==2020)|>
+  mutate(  remote_now=if_else(status_now=="R",1,0),
+           hybrid_now=if_else(status_now=="H",1,0),
+         inperson_now=if_else(status_now=="I",1,0),
+           remote_start=if_else(status_start=="R",1,0),
+           hybrid_start=if_else(status_start=="H",1,0),
+         inperson_start=if_else(status_start=="I",1,0))|>
+  pivot_wider(names_from = vendor,values_from = c("start_date","status_now","open","status_start",
+                                                  "remote_now","hybrid_now","inperson_now",
+                                                  "remote_start","hybrid_start","inperson_start")
+              )|>
+  unnest()
+
+
+corr_data|>
+  mutate(date=lubridate::as_date(7*date)+4)|>
+  select(date,leaid,status_now_R2L:inperson_start_Burbio)|>
+  select(-ends_with("now_MCH"))|>
+  distinct()|>
+  write_csv("corr_data.csv")
+
+
+
+unbalanced_cor_mat<-
+  corr_data|>
+  select(-ends_with("now_MCH"))|>
+  select(log_raw_visit_counts:log_labor_force,remote_now_R2L:inperson_start_Burbio)|>
+  pwcor()
+
+balanced_cor_mat<-
+  corr_data|>
+  select(-ends_with("now_MCH"))|>
+  select(log_raw_visit_counts:log_labor_force,remote_now_R2L:inperson_start_Burbio)|>
+  drop_na()|>
+  cor()
+
+```
+
+```{r depvar-cors}
+unbalanced_cor_mat[1:9,1:9]|>
+  knitr::kable(digits=3,caption="Correlations between dependent variables")
+```
+```{r mode-depvar-cors}
+unbalanced_cor_mat[10:24,1:9]|>
+  knitr::kable(digits=3, caption="Correlation between dependent and idependent variables")|>
+  kableExtra::group_rows(group_label=  "Remote teaching (now)", start_row = 1,end_row = 2)|>
+  kableExtra::group_rows(group_label=  "Hybrid teaching (now)", start_row = 3,end_row = 4)|>
+  kableExtra::group_rows(group_label="Inperson teaching (now)", start_row = 5,end_row = 6)|>
+  kableExtra::group_rows(group_label=  "Remote teaching (start)", start_row = 7,end_row = 9)|>
+  kableExtra::group_rows(group_label=  "Hybrid teaching (start)", start_row =10,end_row = 12)|>
+  kableExtra::group_rows(group_label="Inperson teaching (start)", start_row =13,end_row = 15)
+
+```
+
+```{r mode-cors-now}
+rbind(
+  unbalanced_cor_mat[10:15,10:15])|>
+  knitr::kable(digits=3,
+               # col.names =c( "R2L","Burbio"), 
+               caption = "Correlation between R2L and Burbio in current teaching modality")|>
+  kableExtra::header_separate(sep="_")|>
+  kableExtra::group_rows(group_label="Remote teaching", start_row = 1,end_row = 2)|>
+  kableExtra::group_rows(group_label="Hybrid teaching", start_row = 3,end_row = 4)|>
+  kableExtra::group_rows(group_label="Inperson teaching", start_row = 5,end_row = 6)
+
+```
+
+```{r mode-cors-start}
+rbind(
+  unbalanced_cor_mat[16:24,16:24])|>
+  knitr::kable(digits=3,
+               # col.names =c( "R2L","MCH","Burbio"), 
+               caption="Correlation between starting teaching modalities"
+               )|>
+  kableExtra::header_separate(sep="_")|>
+  kableExtra::group_rows(group_label="Remote teaching", start_row = 1,end_row = 3)|>
+  kableExtra::group_rows(group_label="Hybrid teaching", start_row = 4,end_row = 6)|>
+  kableExtra::group_rows(group_label="Inperson teaching", start_row = 7,end_row = 9)
+  
+```
